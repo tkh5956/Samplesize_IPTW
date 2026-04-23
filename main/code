@@ -1,0 +1,1330 @@
+setwd("YOUR WORKING DIRECTORY")
+rm(list = ls())
+
+# ==============================================================================
+# Main Material: Simulation code for the main manuscript
+# ==============================================================================
+# Scenarios included:
+#   (1) Binary MSM (MCM): p0=0.03
+#   (2) Binary MSM (Secondary): p0=0.10
+#   (3) Count MSM (Poisson)
+#   (4) Continuous cost (Heavy-tailed)
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 0. Libraries
+# ------------------------------------------------------------------------------
+if (!require("numDeriv")) install.packages("numDeriv")
+library(numDeriv)
+library(parallel)
+
+N_CORES <- max(1, parallel::detectCores() - 1)  
+USE_PARALLEL <- TRUE
+
+# ==============================================================================
+# Utilities
+# ==============================================================================
+safe_plogis <- function(eta) plogis(eta)
+
+is_bad_ps <- function(p) any(!is.finite(p)) || any(p == 0) || any(p == 1)
+
+logit_eps <- function(p, eps = 1e-12) qlogis(pmin(pmax(p, eps), 1 - eps))
+
+safe_uniroot <- function(f, lo = -50, hi = 50, expand = 100, max_expand = 3) {
+  f_lo <- f(lo); f_hi <- f(hi)
+  k <- 0
+  while ((!is.finite(f_lo) || !is.finite(f_hi) || f_lo * f_hi > 0) && k < max_expand) {
+    lo <- lo - expand
+    hi <- hi + expand
+    f_lo <- f(lo); f_hi <- f(hi)
+    k <- k + 1
+  }
+  if (!is.finite(f_lo) || !is.finite(f_hi) || f_lo * f_hi > 0) return(NA_real_)
+  uniroot(f, interval = c(lo, hi))$root
+}
+
+make_boot_indices <- function(n, B, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  idx <- matrix(NA_integer_, nrow = B, ncol = n)
+  for (b in 1:B) idx[b, ] <- sample.int(n, size = n, replace = TRUE)
+  idx
+}
+
+# ==============================================================================
+# Bootstrap stability functionals (quantile / mean + UCB variants)
+# ==============================================================================
+bootstrap_ucb_functional <- function(V_ok, phi_fun,
+                                     gamma_ucb = 0.05,
+                                     B_ucb = 1000,
+                                     ucb_idx = NULL,
+                                     seed_ucb = NULL) {
+  V_ok <- V_ok[is.finite(V_ok)]
+  n <- length(V_ok)
+  if (n < 20) return(NA_real_)
+  
+  if (is.null(ucb_idx)) {
+    if (!is.null(seed_ucb)) set.seed(seed_ucb)
+    ucb_idx <- matrix(sample.int(n, size = n * B_ucb, replace = TRUE), nrow = B_ucb, ncol = n)
+  } else {
+    if (!is.matrix(ucb_idx)) stop("ucb_idx must be a matrix (B_ucb x n_ok).")
+    if (ncol(ucb_idx) != n) stop("ucb_idx has wrong number of columns.")
+    if (nrow(ucb_idx) != B_ucb) stop("ucb_idx has wrong number of rows.")
+  }
+  
+  phi_star <- rep(NA_real_, B_ucb)
+  for (k in 1:B_ucb) phi_star[k] <- phi_fun(V_ok[ucb_idx[k, ]])
+  phi_star <- phi_star[is.finite(phi_star)]
+  if (length(phi_star) < max(50, 0.2 * B_ucb)) return(NA_real_)
+  
+  as.numeric(stats::quantile(phi_star, probs = 1 - gamma_ucb, names = FALSE))
+}
+
+compute_V_stable <- function(V_ok,
+                             method = c("quantile", "mean", "ucb_quantile", "ucb_mean"),
+                             q_stable = 0.50,
+                             p_ucb = 0.50,
+                             gamma_ucb = 0.05,
+                             B_ucb = 1000,
+                             ucb_idx = NULL,
+                             seed_ucb = NULL) {
+  method <- match.arg(method)
+  if (!is.numeric(V_ok) || length(V_ok) == 0) return(NA_real_)
+  V_ok <- V_ok[is.finite(V_ok)]
+  n <- length(V_ok)
+  if (n < 10) return(NA_real_)
+  
+  if (method == "mean") {
+    return(as.numeric(mean(V_ok)))
+  }
+  if (method == "quantile") {
+    return(as.numeric(stats::quantile(V_ok, probs = q_stable, names = FALSE)))
+  }
+  if (method == "ucb_mean") {
+    phi_fun <- function(v) mean(v)
+    return(bootstrap_ucb_functional(V_ok, phi_fun,
+                                    gamma_ucb = gamma_ucb, B_ucb = B_ucb,
+                                    ucb_idx = ucb_idx, seed_ucb = seed_ucb))
+  }
+  # ucb_quantile
+  phi_fun <- function(v) as.numeric(stats::quantile(v, probs = p_ucb, names = FALSE))
+  return(bootstrap_ucb_functional(V_ok, phi_fun,
+                                  gamma_ucb = gamma_ucb, B_ucb = B_ucb,
+                                  ucb_idx = ucb_idx, seed_ucb = seed_ucb))
+}
+
+# ==============================================================================
+# Binary outcome (dataset-conditional calibration)
+# ==============================================================================
+calibrate_alpha0 <- function(x, treat_ratio, conf_effect) {
+  f <- function(a0) mean(safe_plogis(a0 + conf_effect * x)) - treat_ratio
+  safe_uniroot(f)
+}
+
+calibrate_gamma0 <- function(x, p0_target, x_y_effect = 0.5) {
+  f <- function(g0) mean(safe_plogis(g0 + x_y_effect * x)) - p0_target
+  safe_uniroot(f)
+}
+
+calibrate_psi_for_msm_logOR <- function(x, gamma0, Delta_target, x_y_effect = 0.5, eps = 1e-12) {
+  p0 <- mean(plogis(gamma0 + x_y_effect * x))
+  if (!is.finite(p0)) return(NA_real_)
+  logit_p0 <- logit_eps(p0, eps = eps)
+  
+  f <- function(psi) {
+    p1 <- mean(plogis(gamma0 + x_y_effect * x + psi))
+    if (!is.finite(p1)) return(NA_real_)
+    (logit_eps(p1, eps = eps) - logit_p0) - Delta_target
+  }
+  
+  lo <- -40; hi <- 40
+  f_lo <- f(lo); f_hi <- f(hi)
+  k <- 0
+  while ((!is.finite(f_lo) || !is.finite(f_hi) || f_lo * f_hi > 0) && k < 8) {
+    lo <- lo - 20
+    hi <- hi + 20
+    f_lo <- f(lo); f_hi <- f(hi)
+    k <- k + 1
+  }
+  if (!is.finite(f_lo) || !is.finite(f_hi) || f_lo * f_hi > 0) return(NA_real_)
+  uniroot(f, interval = c(lo, hi))$root
+}
+
+generate_causal_data_binary <- function(n,
+                                        treat_ratio = 0.25,
+                                        conf_effect = 0.8,
+                                        Delta_target = log(2),
+                                        p0_target = 0.03,
+                                        x_y_effect = 0.5,
+                                        eps_logit = 1e-12) {
+  x <- rnorm(n)
+  
+  alpha0 <- calibrate_alpha0(x, treat_ratio = treat_ratio, conf_effect = conf_effect)
+  if (!is.finite(alpha0)) return(NULL)
+  
+  ps <- safe_plogis(alpha0 + conf_effect * x)
+  if (is_bad_ps(ps)) return(NULL)
+  
+  t <- rbinom(n, 1, ps)
+  
+  gamma0 <- calibrate_gamma0(x, p0_target = p0_target, x_y_effect = x_y_effect)
+  if (!is.finite(gamma0)) return(NULL)
+  
+  psi <- calibrate_psi_for_msm_logOR(
+    x, gamma0 = gamma0, Delta_target = Delta_target,
+    x_y_effect = x_y_effect, eps = eps_logit
+  )
+  if (!is.finite(psi)) return(NULL)
+  
+  y0_prob <- safe_plogis(gamma0 + x_y_effect * x)
+  y1_prob <- safe_plogis(gamma0 + x_y_effect * x + psi)
+  if (any(!is.finite(y0_prob)) || any(!is.finite(y1_prob))) return(NULL)
+  
+  y0 <- rbinom(n, 1, y0_prob)
+  y1 <- rbinom(n, 1, y1_prob)
+  y  <- ifelse(t == 1, y1, y0)
+  
+  data.frame(id = 1:n, y = y, t = t, x = x)
+}
+
+get_stacked_variance_binary <- function(data) {
+  mod_ps <- glm(t ~ x, data = data, family = binomial)
+  alpha_hat <- coef(mod_ps)
+  if (any(!is.finite(alpha_hat))) return(NA_real_)
+  
+  ps_h <- predict(mod_ps, type = "response")
+  if (is_bad_ps(ps_h)) return(NA_real_)
+  
+  w <- ifelse(data$t == 1, 1 / ps_h, 1 / (1 - ps_h))
+  if (any(!is.finite(w))) return(NA_real_)
+  
+  mod_msm <- suppressWarnings(glm(y ~ t, data = data, family = binomial, weights = w))
+  beta_hat <- coef(mod_msm)
+  if (any(!is.finite(beta_hat))) return(NA_real_)
+  
+  theta <- c(alpha_hat, beta_hat)  # (alpha0, alpha1, beta0, beta1)
+  p_al <- length(alpha_hat)
+  p_be <- length(beta_hat)
+  p_tot <- p_al + p_be
+  
+  psi_joint <- function(th, dat) {
+    al <- th[1:p_al]
+    be <- th[(p_al + 1):(p_al + p_be)]
+    
+    X_mat <- cbind(1, dat$x)
+    e_x <- safe_plogis(as.numeric(X_mat %*% al))
+    if (is_bad_ps(e_x)) return(matrix(NA_real_, nrow(dat), p_tot))
+    u_alpha <- X_mat * (dat$t - e_x)
+    
+    W_x <- ifelse(dat$t == 1, 1 / e_x, 1 / (1 - e_x))
+    if (any(!is.finite(W_x))) return(matrix(NA_real_, nrow(dat), p_tot))
+    
+    T_mat <- cbind(1, dat$t)
+    mu <- safe_plogis(as.numeric(T_mat %*% be))
+    if (any(!is.finite(mu))) return(matrix(NA_real_, nrow(dat), p_tot))
+    
+    u_beta <- T_mat * W_x * (dat$y - mu)
+    cbind(u_alpha, u_beta)
+  }
+  
+  n_obs <- nrow(data)
+  U <- psi_joint(theta, data)
+  if (any(!is.finite(U))) return(NA_real_)
+  
+  Bmat <- (t(U) %*% U) / n_obs
+  
+  psi_sum <- function(th) colSums(psi_joint(th, data))
+  A <- tryCatch(numDeriv::jacobian(psi_sum, theta), error = function(e) NULL)
+  if (is.null(A) || any(!is.finite(A))) return(NA_real_)
+  A <- A / n_obs
+  
+  invA <- tryCatch(solve(A), error = function(e) NULL)
+  if (is.null(invA) || any(!is.finite(invA))) return(NA_real_)
+  
+  vcov_total <- (invA %*% Bmat %*% t(invA)) / n_obs
+  out <- vcov_total[p_al + 2, p_al + 2]
+  if (!is.finite(out) || out <= 0) return(NA_real_)
+  out
+}
+
+fit_and_test_stacked_binary <- function(data, alpha_sig = 0.05) {
+  mod_ps <- glm(t ~ x, data = data, family = binomial)
+  ps_h <- predict(mod_ps, type = "response")
+  if (is_bad_ps(ps_h)) return(list(reject = FALSE, ok = FALSE))
+  
+  w <- ifelse(data$t == 1, 1 / ps_h, 1 / (1 - ps_h))
+  if (any(!is.finite(w))) return(list(reject = FALSE, ok = FALSE))
+  
+  mod_msm <- suppressWarnings(glm(y ~ t, data = data, family = binomial, weights = w))
+  beta_hat <- coef(mod_msm)
+  if (any(!is.finite(beta_hat))) return(list(reject = FALSE, ok = FALSE))
+  
+  v_beta1 <- get_stacked_variance_binary(data)
+  if (!is.finite(v_beta1)) return(list(reject = FALSE, ok = FALSE))
+  
+  z <- beta_hat["t"] / sqrt(v_beta1)
+  crit <- qnorm(1 - alpha_sig / 2)
+  list(reject = is.finite(z) && abs(z) > crit, ok = TRUE)
+}
+
+compute_V_ok_binary_from_pilot <- function(pilot_data, boot_idx, pilot_size) {
+  B_reps <- nrow(boot_idx)
+  V_boot <- rep(NA_real_, B_reps)
+  
+  for (b in 1:B_reps) {
+    boot_sample <- pilot_data[boot_idx[b, ], , drop = FALSE]
+    if (length(unique(boot_sample$t)) < 2) next
+    if (length(unique(boot_sample$y)) < 2) next
+    v_hat <- tryCatch(get_stacked_variance_binary(boot_sample), error = function(e) NA_real_)
+    if (is.finite(v_hat)) V_boot[b] <- pilot_size * v_hat
+  }
+  V_ok <- V_boot[is.finite(V_boot)]
+  list(V_ok = V_ok, V_boot = V_boot)
+}
+
+# ==============================================================================
+# Count outcome (Poisson/log link)
+# ==============================================================================
+generate_causal_data_count <- function(n,
+                                       treat_ratio = 0.67,
+                                       conf_effect = 0.5,
+                                       Delta_target = log(0.53),
+                                       base_rate = 0.0006) {
+  x <- rnorm(n)
+  
+  alpha0 <- calibrate_alpha0(x, treat_ratio = treat_ratio, conf_effect = conf_effect)
+  if (!is.finite(alpha0)) return(NULL)
+  
+  ps <- safe_plogis(alpha0 + conf_effect * x)
+  if (is_bad_ps(ps)) return(NULL)
+  
+  t <- rbinom(n, 1, ps)
+  
+  x_y_effect <- 0.3
+  log_base <- log(base_rate)
+  lambda0 <- exp(log_base + x_y_effect * x)
+  lambda1 <- exp(log_base + x_y_effect * x + Delta_target)
+  y <- ifelse(t == 1, rpois(n, lambda1), rpois(n, lambda0))
+  
+  data.frame(y = y, t = t, x = x)
+}
+
+get_stacked_variance_count <- function(data) {
+  mod_ps <- glm(t ~ x, data = data, family = binomial)
+  alpha_hat <- coef(mod_ps)
+  if (any(!is.finite(alpha_hat))) return(NA_real_)
+  
+  ps_h <- predict(mod_ps, type = "response")
+  if (is_bad_ps(ps_h)) return(NA_real_)
+  
+  w <- ifelse(data$t == 1, 1 / ps_h, 1 / (1 - ps_h))
+  if (any(!is.finite(w))) return(NA_real_)
+  
+  mod_msm <- suppressWarnings(glm(y ~ t, data = data, family = poisson, weights = w))
+  beta_hat <- coef(mod_msm)
+  if (any(!is.finite(beta_hat))) return(NA_real_)
+  
+  theta <- c(alpha_hat, beta_hat)
+  p_al <- length(alpha_hat)
+  p_be <- length(beta_hat)
+  p_tot <- p_al + p_be
+  
+  psi_joint <- function(th, dat) {
+    al <- th[1:p_al]
+    be <- th[(p_al + 1):(p_al + p_be)]
+    
+    X_mat <- cbind(1, dat$x)
+    e_x <- safe_plogis(as.numeric(X_mat %*% al))
+    if (is_bad_ps(e_x)) return(matrix(NA_real_, nrow(dat), p_tot))
+    u_alpha <- X_mat * (dat$t - e_x)
+    
+    W_x <- ifelse(dat$t == 1, 1 / e_x, 1 / (1 - e_x))
+    if (any(!is.finite(W_x))) return(matrix(NA_real_, nrow(dat), p_tot))
+    
+    T_mat <- cbind(1, dat$t)
+    mu <- exp(as.numeric(T_mat %*% be))
+    if (any(!is.finite(mu))) return(matrix(NA_real_, nrow(dat), p_tot))
+    
+    u_beta <- T_mat * W_x * (dat$y - mu)
+    cbind(u_alpha, u_beta)
+  }
+  
+  n_obs <- nrow(data)
+  U <- psi_joint(theta, data)
+  if (any(!is.finite(U))) return(NA_real_)
+  
+  Bmat <- (t(U) %*% U) / n_obs
+  
+  psi_sum <- function(th) colSums(psi_joint(th, data))
+  A <- tryCatch(numDeriv::jacobian(psi_sum, theta), error = function(e) NULL)
+  if (is.null(A) || any(!is.finite(A))) return(NA_real_)
+  A <- A / n_obs
+  
+  invA <- tryCatch(solve(A), error = function(e) NULL)
+  if (is.null(invA) || any(!is.finite(invA))) return(NA_real_)
+  
+  vcov_total <- (invA %*% Bmat %*% t(invA)) / n_obs
+  out <- vcov_total[p_al + 2, p_al + 2]
+  if (!is.finite(out) || out <= 0) return(NA_real_)
+  out
+}
+
+fit_and_test_stacked_count <- function(data, alpha_sig = 0.05) {
+  mod_ps <- glm(t ~ x, data = data, family = binomial)
+  ps_h <- predict(mod_ps, type = "response")
+  if (is_bad_ps(ps_h)) return(list(reject = FALSE, ok = FALSE))
+  
+  w <- ifelse(data$t == 1, 1 / ps_h, 1 / (1 - ps_h))
+  if (any(!is.finite(w))) return(list(reject = FALSE, ok = FALSE))
+  
+  mod_msm <- suppressWarnings(glm(y ~ t, data = data, family = poisson, weights = w))
+  beta_hat <- coef(mod_msm)
+  if (any(!is.finite(beta_hat))) return(list(reject = FALSE, ok = FALSE))
+  
+  v_beta1 <- get_stacked_variance_count(data)
+  if (!is.finite(v_beta1)) return(list(reject = FALSE, ok = FALSE))
+  
+  z <- beta_hat["t"] / sqrt(v_beta1)
+  crit <- qnorm(1 - alpha_sig / 2)
+  list(reject = is.finite(z) && abs(z) > crit, ok = TRUE)
+}
+
+compute_V_ok_count_from_pilot <- function(pilot_data, boot_idx, pilot_size) {
+  B_reps <- nrow(boot_idx)
+  V_boot <- rep(NA_real_, B_reps)
+  
+  for (b in 1:B_reps) {
+    smp <- pilot_data[boot_idx[b, ], , drop = FALSE]
+    if (length(unique(smp$t)) < 2) next
+    if (sum(smp$y[smp$t == 1]) == 0) next
+    if (sum(smp$y[smp$t == 0]) == 0) next
+    v_hat <- tryCatch(get_stacked_variance_count(smp), error = function(e) NA_real_)
+    if (is.finite(v_hat)) V_boot[b] <- pilot_size * v_hat
+  }
+  V_ok <- V_boot[is.finite(V_boot)]
+  list(V_ok = V_ok, V_boot = V_boot)
+}
+
+# ==============================================================================
+# Continuous cost outcome
+# ==============================================================================
+generate_causal_data_cont <- function(n,
+                                      treat_ratio = 131/364,
+                                      conf_strength = 0.6,
+                                      mu0 = 18354,
+                                      Delta_target = 5000,
+                                      sigma_y = 3000,
+                                      df_t = 4) {
+  x  <- rnorm(n)
+  brain_mets <- rbinom(n, 1, 0.23)
+  imp_ps     <- rbinom(n, 1, 0.11)
+  comorb     <- rbinom(n, 1, 0.54)
+  
+  lin_base <- conf_strength * (0.7*x + 0.8*brain_mets + 1.0*imp_ps + 0.5*comorb)
+  f_a0 <- function(a0) mean(safe_plogis(a0 + lin_base)) - treat_ratio
+  a0 <- safe_uniroot(f_a0)
+  if (!is.finite(a0)) return(NULL)
+  
+  ps <- safe_plogis(a0 + lin_base)
+  if (is_bad_ps(ps)) return(NULL)
+  t <- rbinom(n, 1, ps)
+  
+  mu_x <- mu0 + 1200*x + 3500*brain_mets + 4500*imp_ps + 2000*comorb + Delta_target * t
+  
+  sd_i <- sigma_y * exp(0.15*abs(x) + 0.10*brain_mets + 0.15*imp_ps)
+  
+  # Scale t errors to have variance sd_i^2
+  eps <- rt(n, df = df_t) * (sd_i * sqrt((df_t - 2) / df_t))
+  
+  y <- mu_x + eps
+  
+  data.frame(id = 1:n, y = y, t = t, x = x,
+             brain_mets = brain_mets, imp_ps = imp_ps, comorb = comorb)
+}
+
+get_stacked_variance_cont <- function(data) {
+  mod_ps <- glm(t ~ x + brain_mets + imp_ps + comorb, data = data, family = binomial)
+  alpha_hat <- coef(mod_ps)
+  if (any(!is.finite(alpha_hat))) return(NA_real_)
+  
+  ps_h <- predict(mod_ps, type = "response")
+  if (is_bad_ps(ps_h)) return(NA_real_)
+  
+  w <- ifelse(data$t == 1, 1 / ps_h, 1 / (1 - ps_h))
+  if (any(!is.finite(w))) return(NA_real_)
+  
+  mod_msm <- suppressWarnings(glm(y ~ t, data = data, family = gaussian, weights = w))
+  beta_hat <- coef(mod_msm)
+  if (any(!is.finite(beta_hat))) return(NA_real_)
+  
+  theta <- c(alpha_hat, beta_hat)
+  p_al <- length(alpha_hat)
+  p_be <- length(beta_hat)
+  p_tot <- p_al + p_be
+  
+  psi_joint <- function(th, dat) {
+    al <- th[1:p_al]
+    be <- th[(p_al + 1):(p_al + p_be)]
+    
+    X_ps <- model.matrix(~ x + brain_mets + imp_ps + comorb, data = dat)
+    e_x <- safe_plogis(as.numeric(X_ps %*% al))
+    if (is_bad_ps(e_x)) return(matrix(NA_real_, nrow(dat), p_tot))
+    u_alpha <- X_ps * (dat$t - e_x)
+    
+    W_x <- ifelse(dat$t == 1, 1 / e_x, 1 / (1 - e_x))
+    if (any(!is.finite(W_x))) return(matrix(NA_real_, nrow(dat), p_tot))
+    
+    X_msm <- model.matrix(~ t, data = dat)
+    mu <- as.numeric(X_msm %*% be)
+    if (any(!is.finite(mu))) return(matrix(NA_real_, nrow(dat), p_tot))
+    
+    u_beta <- X_msm * W_x * (dat$y - mu)
+    cbind(u_alpha, u_beta)
+  }
+  
+  n_obs <- nrow(data)
+  U <- psi_joint(theta, data)
+  if (any(!is.finite(U))) return(NA_real_)
+  
+  Bmat <- (t(U) %*% U) / n_obs
+  
+  psi_sum <- function(th) colSums(psi_joint(th, data))
+  A <- tryCatch(numDeriv::jacobian(psi_sum, theta), error = function(e) NULL)
+  if (is.null(A) || any(!is.finite(A))) return(NA_real_)
+  A <- A / n_obs
+  
+  invA <- tryCatch(solve(A), error = function(e) NULL)
+  if (is.null(invA) || any(!is.finite(invA))) return(NA_real_)
+  
+  vcov_total <- (invA %*% Bmat %*% t(invA)) / n_obs
+  
+  # beta1 corresponds to t coefficient in MSM, which is 2nd element in beta_hat
+  out <- vcov_total[p_al + 2, p_al + 2]
+  if (!is.finite(out) || out <= 0) return(NA_real_)
+  out
+}
+
+fit_and_test_stacked_cont <- function(data, alpha_sig = 0.05) {
+  mod_ps <- glm(t ~ x + brain_mets + imp_ps + comorb, data = data, family = binomial)
+  ps_h <- predict(mod_ps, type = "response")
+  if (is_bad_ps(ps_h)) return(list(reject = FALSE, ok = FALSE))
+  
+  w <- ifelse(data$t == 1, 1 / ps_h, 1 / (1 - ps_h))
+  if (any(!is.finite(w))) return(list(reject = FALSE, ok = FALSE))
+  
+  mod_msm <- suppressWarnings(glm(y ~ t, data = data, family = gaussian, weights = w))
+  beta_hat <- coef(mod_msm)
+  if (any(!is.finite(beta_hat))) return(list(reject = FALSE, ok = FALSE))
+  
+  v_beta1 <- get_stacked_variance_cont(data)
+  if (!is.finite(v_beta1)) return(list(reject = FALSE, ok = FALSE))
+  
+  z <- beta_hat["t"] / sqrt(v_beta1)
+  crit <- qnorm(1 - alpha_sig / 2)
+  list(reject = is.finite(z) && abs(z) > crit, ok = TRUE)
+}
+
+compute_V_ok_cont_from_pilot <- function(pilot_data, boot_idx, pilot_size) {
+  B_reps <- nrow(boot_idx)
+  V_boot <- rep(NA_real_, B_reps)
+  
+  for (b in 1:B_reps) {
+    boot_sample <- pilot_data[boot_idx[b, ], , drop = FALSE]
+    if (length(unique(boot_sample$t)) < 2) next
+    if (sd(boot_sample$y) <= 0) next
+    v_hat <- tryCatch(get_stacked_variance_cont(boot_sample), error = function(e) NA_real_)
+    if (is.finite(v_hat)) V_boot[b] <- pilot_size * v_hat
+  }
+  V_ok <- V_boot[is.finite(V_boot)]
+  list(V_ok = V_ok, V_boot = V_boot)
+}
+
+# ==============================================================================
+# Power validation helpers (NSIMS = 2000)
+# ==============================================================================
+validate_power_binary <- function(N, p0_baseline,
+                                  n_sims = 2000,
+                                  treat_ratio = 0.25,
+                                  Delta_target = log(2),
+                                  alpha_sig = 0.05) {
+  rejects <- logical(n_sims)
+  oks     <- logical(n_sims)
+  for (s in 1:n_sims) {
+    dat <- generate_causal_data_binary(
+      n = N, treat_ratio = treat_ratio, Delta_target = Delta_target, p0_target = p0_baseline
+    )
+    if (is.null(dat)) { rejects[s] <- FALSE; oks[s] <- FALSE; next }
+    res <- tryCatch(fit_and_test_stacked_binary(dat, alpha_sig = alpha_sig),
+                    error = function(e) list(reject = FALSE, ok = FALSE))
+    rejects[s] <- res$reject
+    oks[s]     <- res$ok
+  }
+  list(power = mean(rejects[oks]), success_rate = mean(oks))
+}
+
+validate_power_count <- function(N,
+                                 n_sims = 1000,
+                                 base_rate = 0.0006,
+                                 treat_ratio = 0.67,
+                                 Delta_target = log(0.53),
+                                 alpha_sig = 0.05) {
+  rejects <- logical(n_sims)
+  oks     <- logical(n_sims)
+  for (s in 1:n_sims) {
+    dat <- generate_causal_data_count(
+      n = N, treat_ratio = treat_ratio, Delta_target = Delta_target, base_rate = base_rate
+    )
+    if (is.null(dat)) { rejects[s] <- FALSE; oks[s] <- FALSE; next }
+    res <- tryCatch(fit_and_test_stacked_count(dat, alpha_sig = alpha_sig),
+                    error = function(e) list(reject = FALSE, ok = FALSE))
+    rejects[s] <- res$reject
+    oks[s]     <- res$ok
+  }
+  list(power = mean(rejects[oks]), success_rate = mean(oks))
+}
+
+validate_power_cont <- function(N,
+                                n_sims = 1000,
+                                treat_ratio = 131/364,
+                                mu0 = 18354,
+                                Delta_target = 5000,
+                                alpha_sig = 0.05) {
+  rejects <- logical(n_sims)
+  oks     <- logical(n_sims)
+  for (s in 1:n_sims) {
+    dat <- generate_causal_data_cont(
+      n = N, treat_ratio = treat_ratio, mu0 = mu0, Delta_target = Delta_target
+    )
+    if (is.null(dat)) { rejects[s] <- FALSE; oks[s] <- FALSE; next }
+    res <- tryCatch(fit_and_test_stacked_cont(dat, alpha_sig = alpha_sig),
+                    error = function(e) list(reject = FALSE, ok = FALSE))
+    rejects[s] <- res$reject
+    oks[s]     <- res$ok
+  }
+  list(power = mean(rejects[oks]), success_rate = mean(oks))
+}
+
+# ==============================================================================
+# Settings
+# ==============================================================================
+set.seed(123)
+
+ALPHA_SIG    <- 0.05
+TARGET_POWER <- 0.80
+
+# Pilot replicates (outer loop) and bootstraps (inner)
+PILOT_REPS <- 1000
+B_REPS     <- 1000   
+B_UCB      <- 1000   
+NSIMS_POWER <- 2000
+
+# UCB
+P_UCB     <- 0.50
+GAMMA_UCB <- 0.05
+
+# Binary
+TREAT_RATIO_BIN  <- 0.25
+DELTA_TARGET_BIN <- log(2)
+PILOT_BIN        <- 600
+
+# Count 
+TREAT_RATIO_CNT  <- 0.67
+DELTA_TARGET_CNT <- log(0.5)
+LAMBDA_BASE      <- 0.008 
+PILOT_CNT        <- 5000  
+
+# cont 
+PILOT_cont        <- 350
+TREAT_RATIO_cont  <- 0.36  
+DELTA_TARGET_cont <- 1500
+MU0_cont          <- 18000
+
+# Stability specs
+STABLE_SPECS <- list(
+  list(name = "median",      method = "quantile",     q = 0.50),
+  list(name = "q70",         method = "quantile",     q = 0.70),
+  list(name = "q90",         method = "quantile",     q = 0.90),
+  list(name = "mean",        method = "mean",         q = NA_real_),
+  list(name = "ucb_median",  method = "ucb_quantile", q = NA_real_),
+  list(name = "ucb_mean",    method = "ucb_mean",     q = NA_real_)
+)
+
+z_vals <- (qnorm(1 - ALPHA_SIG / 2) + qnorm(TARGET_POWER))^2
+
+# ==============================================================================
+# One-pilot runner functions (return N across stability choices + N_RCT)
+# ==============================================================================
+run_one_pilot_binary <- function(p0_baseline, rep_id) {
+  pilot_data <- generate_causal_data_binary(
+    n = PILOT_BIN,
+    treat_ratio = TREAT_RATIO_BIN,
+    Delta_target = DELTA_TARGET_BIN,
+    p0_target = p0_baseline
+  )
+  if (is.null(pilot_data)) return(NULL)
+  
+  boot_idx <- make_boot_indices(n = nrow(pilot_data), B = B_REPS,
+                                seed = 10000 + 1000*rep_id + as.integer(round(100*p0_baseline)))
+  
+  V_res <- compute_V_ok_binary_from_pilot(pilot_data, boot_idx, pilot_size = PILOT_BIN)
+  V_ok <- V_res$V_ok
+  if (length(V_ok) < 100) return(NULL)
+  
+  ucb_idx <- make_boot_indices(n = length(V_ok), B = B_UCB,
+                               seed = 20000 + 1000*rep_id + as.integer(round(100*p0_baseline)))
+  
+  # RCT benchmark N
+  delta <- DELTA_TARGET_BIN
+  p1_target <- plogis(qlogis(p0_baseline) + DELTA_TARGET_BIN)
+  var_logit_rct <- (1 / (TREAT_RATIO_BIN * p1_target * (1 - p1_target))) +
+    (1 / ((1 - TREAT_RATIO_BIN) * p0_baseline * (1 - p0_baseline)))
+  N_rct <- ceiling((z_vals * var_logit_rct) / (delta^2))
+  
+  sc_name <- paste0("binary_p0_", sprintf("%.2f", p0_baseline))
+  
+  out <- data.frame(
+    rep_id = integer(0),
+    scenario = character(0),
+    stable_name = character(0),
+    N_proposed = integer(0),
+    V_stable = numeric(0),
+    N_rct = integer(0),
+    stringsAsFactors = FALSE
+  )
+  
+  for (sp in STABLE_SPECS) {
+    V_stable <- compute_V_stable(
+      V_ok,
+      method = sp$method,
+      q_stable = ifelse(is.na(sp$q), 0.50, sp$q),
+      p_ucb = P_UCB,
+      gamma_ucb = GAMMA_UCB,
+      B_ucb = B_UCB,
+      ucb_idx = ucb_idx
+    )
+    if (!is.finite(V_stable)) next
+    
+    N_prop <- ceiling((z_vals * V_stable) / (delta^2))
+    out <- rbind(out, data.frame(
+      rep_id = rep_id,
+      scenario = sc_name,
+      stable_name = sp$name,
+      N_proposed = as.integer(N_prop),
+      V_stable = as.numeric(V_stable),
+      N_rct = as.integer(N_rct),
+      stringsAsFactors = FALSE
+    ))
+    
+  }
+  if (nrow(out) == 0) return(NULL)
+  out
+}
+
+run_one_pilot_count <- function(rep_id) {
+  pilot_data <- generate_causal_data_count(
+    n = PILOT_CNT,
+    treat_ratio = TREAT_RATIO_CNT,
+    Delta_target = DELTA_TARGET_CNT,
+    base_rate = LAMBDA_BASE
+  )
+  if (is.null(pilot_data)) return(NULL)
+  
+  boot_idx <- make_boot_indices(n = nrow(pilot_data), B = B_REPS, seed = 11000 + 1000*rep_id)
+  
+  V_res <- compute_V_ok_count_from_pilot(pilot_data, boot_idx, pilot_size = PILOT_CNT)
+  V_ok <- V_res$V_ok
+  if (length(V_ok) < 100) return(NULL)
+  
+  ucb_idx <- make_boot_indices(n = length(V_ok), B = B_UCB, seed = 21000 + 1000*rep_id)
+  
+  delta <- DELTA_TARGET_CNT
+  lambda0 <- LAMBDA_BASE
+  lambda1 <- exp(log(lambda0) + DELTA_TARGET_CNT)
+  var_rct_unit <- (1 / (TREAT_RATIO_CNT * lambda1)) + (1 / ((1 - TREAT_RATIO_CNT) * lambda0))
+  N_rct <- ceiling((z_vals * var_rct_unit) / (delta^2))
+  
+  out <- data.frame(
+    rep_id = integer(0),
+    scenario = character(0),
+    stable_name = character(0),
+    N_proposed = integer(0),
+    V_stable = numeric(0),
+    N_rct = integer(0),
+    stringsAsFactors = FALSE
+  )
+  
+  
+  for (sp in STABLE_SPECS) {
+    V_stable <- compute_V_stable(
+      V_ok,
+      method = sp$method,
+      q_stable = ifelse(is.na(sp$q), 0.50, sp$q),
+      p_ucb = P_UCB,
+      gamma_ucb = GAMMA_UCB,
+      B_ucb = B_UCB,
+      ucb_idx = ucb_idx
+    )
+    if (!is.finite(V_stable)) next
+    
+    N_prop <- ceiling((z_vals * V_stable) / (delta^2))
+    out <- rbind(out, data.frame(
+      rep_id = rep_id,
+      scenario = "count",
+      stable_name = sp$name,
+      N_proposed = as.integer(N_prop),
+      V_stable = as.numeric(V_stable),
+      N_rct = as.integer(N_rct),
+      stringsAsFactors = FALSE
+    ))
+  }
+  if (nrow(out) == 0) return(NULL)
+  out
+}
+
+run_one_pilot_cont <- function(rep_id) {
+  pilot_data <- generate_causal_data_cont(
+    n = PILOT_cont,
+    treat_ratio = TREAT_RATIO_cont,
+    mu0 = MU0_cont,
+    Delta_target = DELTA_TARGET_cont
+  )
+  if (is.null(pilot_data)) return(NULL)
+  
+  boot_idx <- make_boot_indices(n = nrow(pilot_data), B = B_REPS, seed = 13000 + 1000*rep_id)
+  
+  V_res <- compute_V_ok_cont_from_pilot(pilot_data, boot_idx, pilot_size = PILOT_cont)
+  V_ok <- V_res$V_ok
+  if (length(V_ok) < 100) return(NULL)
+  
+  ucb_idx <- make_boot_indices(n = length(V_ok), B = B_UCB, seed = 23000 + 1000*rep_id)
+  
+  delta <- DELTA_TARGET_cont
+  
+  sigma2_hat <- stats::var(pilot_data$y)
+  if (!is.finite(sigma2_hat) || sigma2_hat <= 0) sigma2_hat <- 1
+  V_rct_unit <- sigma2_hat * (1 / TREAT_RATIO_cont + 1 / (1 - TREAT_RATIO_cont))
+  N_rct <- ceiling((z_vals * V_rct_unit) / (delta^2))
+  
+  out <- data.frame(
+    rep_id = integer(0),
+    scenario = character(0),
+    stable_name = character(0),
+    N_proposed = integer(0),
+    V_stable = numeric(0),
+    N_rct = integer(0),
+    stringsAsFactors = FALSE
+  )
+  
+  
+  for (sp in STABLE_SPECS) {
+    V_stable <- compute_V_stable(
+      V_ok,
+      method = sp$method,
+      q_stable = ifelse(is.na(sp$q), 0.50, sp$q),
+      p_ucb = P_UCB,
+      gamma_ucb = GAMMA_UCB,
+      B_ucb = B_UCB,
+      ucb_idx = ucb_idx
+    )
+    if (!is.finite(V_stable)) next
+    
+    N_prop <- ceiling((z_vals * V_stable) / (delta^2))
+    out <- rbind(out, data.frame(
+      rep_id = rep_id,
+      scenario = "cont",
+      stable_name = sp$name,
+      N_proposed = as.integer(N_prop),
+      V_stable = as.numeric(V_stable),
+      N_rct = as.integer(N_rct),
+      stringsAsFactors = FALSE
+    ))
+    
+  }
+  if (nrow(out) == 0) return(NULL)
+  out
+}
+
+# ==============================================================================
+# 1) Run PILOT_REPS pilots and collect N_proposed distributions
+# ==============================================================================
+message(sprintf("Running pilot uncertainty experiment: PILOT_REPS=%d, B_REPS=%d ...", PILOT_REPS, B_REPS))
+
+pilot_worker <- function(r) {
+  if (r %% 25 == 0) message(sprintf("  pilot rep %d / %d", r, PILOT_REPS))
+  
+  tmp1 <- tryCatch(run_one_pilot_binary(p0_baseline = 0.03, rep_id = r), error = function(e) NULL)
+  tmp2 <- tryCatch(run_one_pilot_binary(p0_baseline = 0.10, rep_id = r), error = function(e) NULL)
+  tmp3 <- tryCatch(run_one_pilot_count(rep_id = r), error = function(e) NULL)
+  tmp4 <- tryCatch(run_one_pilot_cont(rep_id = r), error = function(e) NULL)
+  
+  out <- list(tmp1, tmp2, tmp3, tmp4)
+  out <- out[!vapply(out, is.null, logical(1))]
+  if (length(out) == 0) return(NULL)
+  do.call(rbind, out)
+}
+
+if (USE_PARALLEL && N_CORES > 1) {
+  cl <- parallel::makeCluster(N_CORES)
+  on.exit(parallel::stopCluster(cl), add = TRUE)
+  
+  parallel::clusterSetRNGStream(cl, iseed = 123)
+  
+  parallel::clusterExport(
+    cl,
+    varlist = ls(envir = .GlobalEnv),
+    envir = .GlobalEnv
+  )
+  
+  parallel::clusterEvalQ(cl, { library(numDeriv) })
+  
+  all_rows <- parallel::parLapply(cl, X = 1:PILOT_REPS, fun = pilot_worker)
+  
+} else {
+  all_rows <- lapply(1:PILOT_REPS, pilot_worker)
+}
+
+pilot_results <- do.call(rbind, all_rows[!vapply(all_rows, is.null, logical(1))])
+if (is.null(pilot_results) || nrow(pilot_results) == 0) stop("No pilot results collected.")
+
+# ==============================================================================
+# 2) Summarize N_proposed distribution across pilots (by scenario x stability)
+# ==============================================================================
+summarize_N <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) return(rep(NA_real_, 9))
+  c(
+    n = length(x),
+    min = min(x),
+    q10 = as.numeric(quantile(x, 0.10)),
+    q25 = as.numeric(quantile(x, 0.25)),
+    med = as.numeric(quantile(x, 0.50)),
+    mean = mean(x),
+    q75 = as.numeric(quantile(x, 0.75)),
+    q90 = as.numeric(quantile(x, 0.90)),
+    max = max(x)
+  )
+}
+
+message("\n============================================================")
+message("SUMMARY OF PROPOSED N ACROSS PILOT REPLICATES")
+message("============================================================")
+
+scenarios <- unique(pilot_results$scenario)
+for (sc in scenarios) {
+  message(sprintf("\n--- Scenario: %s ---", sc))
+  sc_dat <- pilot_results[pilot_results$scenario == sc, ]
+  
+  # RCT reference 
+  rct_vals <- unique(sc_dat$N_rct)
+  if (length(rct_vals) <= 10) {
+    message(sprintf("RCT N (unique): %s", paste(rct_vals, collapse = ", ")))
+  } else {
+    message(sprintf("RCT N: q10=%d, q25=%d, med=%d, q75=%d, q90=%d",
+                    as.integer(quantile(sc_dat$N_rct, 0.10)),
+                    as.integer(quantile(sc_dat$N_rct, 0.25)),
+                    as.integer(quantile(sc_dat$N_rct, 0.50)),
+                    as.integer(quantile(sc_dat$N_rct, 0.75)),
+                    as.integer(quantile(sc_dat$N_rct, 0.90))))
+  }
+  
+  stabs <- unique(sc_dat$stable_name)
+  for (st in stabs) {
+    vals <- sc_dat$N_proposed[sc_dat$stable_name == st]
+    s <- summarize_N(vals)
+    message(sprintf("  %-10s: n=%.0f | min=%.0f q10=%.0f q25=%.0f med=%.0f mean=%.0f q75=%.0f q90=%.0f max=%.0f",
+                    st, s["n"], s["min"], s["q10"], s["q25"], s["med"], s["mean"], s["q75"], s["q90"], s["max"]))
+    
+  }
+}
+
+# ==============================================================================
+# 3) Power validation on a sparse grid derived from the N-distribution
+# ==============================================================================
+make_sparse_grid <- function(N_vec,
+                             probs = seq(0.05, 0.95, by = 0.05),
+                             include_minmax = TRUE,
+                             include_mean = TRUE,
+                             N_rct = NULL) {
+  N_vec <- N_vec[is.finite(N_vec)]
+  if (length(N_vec) == 0) return(data.frame(N = integer(0), grid_label = character(0)))
+  
+  out_list <- list()
+  
+  # quantiles
+  q_raw <- as.numeric(stats::quantile(N_vec, probs = probs, names = FALSE))
+  q_lab <- paste0("q", as.integer(100 * probs))
+  for (i in seq_along(q_raw)) {
+    out_list[[length(out_list) + 1]] <- data.frame(
+      N = as.integer(ceiling(q_raw[i])),
+      grid_label = q_lab[i],
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  if (include_minmax) {
+    out_list[[length(out_list) + 1]] <- data.frame(N = as.integer(ceiling(min(N_vec))), grid_label = "min", stringsAsFactors = FALSE)
+    out_list[[length(out_list) + 1]] <- data.frame(N = as.integer(ceiling(max(N_vec))), grid_label = "max", stringsAsFactors = FALSE)
+  }
+  
+  if (include_mean) {
+    out_list[[length(out_list) + 1]] <- data.frame(N = as.integer(ceiling(mean(N_vec))), grid_label = "mean", stringsAsFactors = FALSE)
+  }
+  
+  if (!is.null(N_rct) && is.finite(N_rct)) {
+    out_list[[length(out_list) + 1]] <- data.frame(N = as.integer(ceiling(N_rct)), grid_label = "rct_ref", stringsAsFactors = FALSE)
+  }
+  
+  out <- do.call(rbind, out_list)
+  
+  out <- aggregate(grid_label ~ N, data = out, FUN = function(z) paste(sort(unique(z)), collapse = "+"))
+  out <- out[order(out$N), , drop = FALSE]
+  rownames(out) <- NULL
+  out
+}
+
+
+message("\n============================================================")
+message("POWER VALIDATION ON SPARSE N GRID (NSIMS=2000)")
+message("============================================================")
+
+# Build task list first 
+tasks <- list()
+tt <- 1
+
+# Build scenario grids + scenario-level power tasks
+tasks_sc <- list()
+tt <- 1
+
+scenario_grids <- list()  # store each scenario's grid_df_sc for later
+
+for (sc in scenarios) {
+  sc_dat <- pilot_results[pilot_results$scenario == sc, ]
+  
+  # pool across all stability functions for this scenario
+  N_pool <- sc_dat$N_proposed
+  N_rct_ref <- as.numeric(stats::quantile(sc_dat$N_rct, probs = 0.50, names = FALSE))
+  
+  grid_df_sc <- make_sparse_grid(
+    N_pool,
+    probs = seq(0.05, 0.95, by = 0.05),
+    include_minmax = TRUE,
+    include_mean = TRUE,
+    N_rct = N_rct_ref
+  )
+  if (nrow(grid_df_sc) == 0) next
+  
+  scenario_grids[[sc]] <- grid_df_sc
+  
+  message(sprintf("\nScenario=%s | gridN=%s",
+                  sc, paste(grid_df_sc$N, collapse = ", ")))
+  
+  for (ii in 1:nrow(grid_df_sc)) {
+    tasks_sc[[tt]] <- list(
+      sc = sc,
+      N0 = as.integer(grid_df_sc$N[ii]),
+      grid_label = as.character(grid_df_sc$grid_label[ii])
+    )
+    tt <- tt + 1
+  }
+}
+
+
+power_task_worker_sc <- function(task) {
+  sc <- task$sc
+  N0 <- task$N0
+  
+  if (grepl("^binary_p0_", sc)) {
+    p0 <- as.numeric(sub("binary_p0_", "", sc))
+    pw <- validate_power_binary(
+      N = N0, p0_baseline = p0,
+      n_sims = NSIMS_POWER,
+      treat_ratio = TREAT_RATIO_BIN,
+      Delta_target = DELTA_TARGET_BIN,
+      alpha_sig = ALPHA_SIG
+    )
+  } else if (sc == "count") {
+    pw <- validate_power_count(
+      N = N0,
+      n_sims = NSIMS_POWER,
+      base_rate = LAMBDA_BASE,
+      treat_ratio = TREAT_RATIO_CNT,
+      Delta_target = DELTA_TARGET_CNT,
+      alpha_sig = ALPHA_SIG
+    )
+  } else if (sc == "cont") {
+    pw <- validate_power_cont(
+      N = N0,
+      n_sims = NSIMS_POWER,
+      treat_ratio = TREAT_RATIO_cont,
+      mu0 = MU0_cont,
+      Delta_target = DELTA_TARGET_cont,
+      alpha_sig = ALPHA_SIG
+    )
+  } else {
+    return(NULL)
+  }
+  
+  data.frame(
+    scenario = sc,
+    N = as.integer(N0),
+    grid_label = as.character(task$grid_label),
+    power = as.numeric(pw$power),
+    success_rate = as.numeric(pw$success_rate),
+    stringsAsFactors = FALSE
+  )
+}
+
+
+if (length(tasks_sc) == 0) {
+  power_results <- NULL
+} else if (USE_PARALLEL && N_CORES > 1) {
+  cl2 <- parallel::makeCluster(N_CORES)
+  on.exit(parallel::stopCluster(cl2), add = TRUE)
+  parallel::clusterSetRNGStream(cl2, iseed = 456)
+  parallel::clusterExport(cl2, varlist = ls(envir = .GlobalEnv), envir = .GlobalEnv)
+  parallel::clusterEvalQ(cl2, { library(numDeriv) })
+  
+  power_rows <- parallel::parLapply(cl2, tasks_sc, power_task_worker_sc)
+  power_results <- do.call(rbind, power_rows[!vapply(power_rows, is.null, logical(1))])
+  
+} else {
+  power_rows <- lapply(tasks_sc, power_task_worker_sc)
+  power_results <- do.call(rbind, power_rows[!vapply(power_rows, is.null, logical(1))])
+}
+
+if (!is.null(power_results) && nrow(power_results) > 0) {
+  power_results <- power_results[order(power_results$scenario, power_results$N), , drop = FALSE]
+}
+
+# ==============================================================================
+# 3a-extra) Attach interpolated power at N_proposed and at N_rct to pilot_results
+# ==============================================================================
+
+if (!is.null(power_results) && nrow(power_results) > 0) {
+  
+  # Helper: scenario-specific power interpolator using sparse grid
+  power_at_N <- function(sc, N_vec, enforce_monotone = TRUE) {
+    grd <- power_results[power_results$scenario == sc, , drop = FALSE]
+    if (nrow(grd) < 2) return(rep(NA_real_, length(N_vec)))
+    
+    # collapse duplicates if any
+    grd <- aggregate(power ~ N, data = grd, FUN = mean)
+    
+    gridN <- as.numeric(grd$N)
+    gridP <- as.numeric(grd$power)
+    ord <- order(gridN)
+    gridN <- gridN[ord]
+    gridP <- gridP[ord]
+    
+    if (enforce_monotone) gridP <- cummax(gridP)
+    
+    # approx power at arbitrary N (rule=2 -> extrapolate with endpoints)
+    p_hat <- approx(x = gridN, y = gridP, xout = as.numeric(N_vec),
+                    rule = 2, ties = "ordered")$y
+    as.numeric(p_hat)
+  }
+  
+  # Add columns
+  pilot_results$power_Nprop <- NA_real_
+  pilot_results$power_Nrct  <- NA_real_
+  
+  # Fill per scenario
+  scenarios <- unique(pilot_results$scenario)
+  for (sc in scenarios) {
+    idx_sc <- which(pilot_results$scenario == sc)
+    
+    # power at proposed N (row-specific)
+    pilot_results$power_Nprop[idx_sc] <- power_at_N(sc, pilot_results$N_proposed[idx_sc],
+                                                    enforce_monotone = TRUE)
+    
+    # power at RCT N (row-specific)
+    pilot_results$power_Nrct[idx_sc]  <- power_at_N(sc, pilot_results$N_rct[idx_sc],
+                                                    enforce_monotone = TRUE)
+  }
+  
+  message("\nAdded columns to pilot_results: power_Nprop (power at N_proposed), power_Nrct (power at N_rct).")
+  
+} else {
+  message("\nNo power_results available; skipping attachment of per-row powers to pilot_results.")
+}
+
+
+# ==============================================================================
+# 3b) Hit-rate summary: how often mapped empirical power >= TARGET_POWER
+#      (maps each replicate's induced N to nearest grid N within scenario x stability)
+# ==============================================================================
+
+if (!is.null(power_results) && nrow(power_results) > 0) {
+  interp_required_N <- function(gridN, gridP, target_power = 0.80, enforce_monotone = TRUE) {
+    okg <- is.finite(gridN) & is.finite(gridP)
+    gridN <- as.numeric(gridN[okg]); gridP <- as.numeric(gridP[okg])
+    if (length(gridN) < 2) return(NA_real_)
+    
+    ord <- order(gridN)
+    gridN <- gridN[ord]; gridP <- gridP[ord]
+    
+    if (enforce_monotone) gridP <- cummax(gridP)
+    
+    # If never reaches target, return NA 
+    if (max(gridP, na.rm = TRUE) < target_power) return(NA_real_)
+    # If already above target at min gridN
+    if (gridP[1] >= target_power) return(gridN[1])
+    
+    # Find first index where power >= target
+    j <- which(gridP >= target_power)[1]
+    if (is.na(j) || j == 1) return(gridN[1])
+    
+    # Linear interpolation between (j-1) and j
+    N1 <- gridN[j - 1]; N2 <- gridN[j]
+    P1 <- gridP[j - 1]; P2 <- gridP[j]
+    if (!is.finite(P1) || !is.finite(P2) || P2 == P1) return(N2)
+    
+    N_star <- N1 + (target_power - P1) * (N2 - N1) / (P2 - P1)
+    as.numeric(N_star)
+  }
+  
+  interp_power_at_N <- function(N_vec, gridN, gridP, enforce_monotone = TRUE) {
+    # Interpolate power at arbitrary N values using approx().
+    
+    okg <- is.finite(gridN) & is.finite(gridP)
+    gridN <- as.numeric(gridN[okg])
+    gridP <- as.numeric(gridP[okg])
+    
+    if (length(gridN) < 2) {
+      return(list(power = rep(NA_real_, length(N_vec)), N_used = rep(NA_integer_, length(N_vec))))
+    }
+    
+    ord <- order(gridN)
+    gridN <- gridN[ord]
+    gridP <- gridP[ord]
+    
+    # Monotonicity 
+    if (enforce_monotone) {
+      gridP <- cummax(gridP)
+    }
+    
+    # approx() needs unique x values
+    dup <- duplicated(gridN)
+    if (any(dup)) {
+      gridN_u <- gridN[!dup]
+      gridP_u <- gridP[!dup]
+      gridN <- gridN_u
+      gridP <- gridP_u
+    }
+    
+    # Interpolate/extrapolate
+    N_vec_num <- as.numeric(N_vec)
+    p_hat <- approx(x = gridN, y = gridP, xout = N_vec_num,
+                    rule = 2, ties = "ordered")$y
+    
+    list(power = p_hat, N_used = as.integer(round(N_vec_num)))
+  }
+  
+  
+  message("\n============================================================")
+  message("HIT-RATE SUMMARY: Pr(empirical power >= TARGET_POWER) by stability")
+  message("(Power is mapped via nearest N on the sparse grid within scenario x stability)")
+  message("============================================================")
+  
+  hit_rows <- list()
+  hh <- 1
+  
+  for (sc in scenarios) {
+    sc_dat <- pilot_results[pilot_results$scenario == sc, , drop = FALSE]
+    stabs <- c(unique(sc_dat$stable_name), "rct")
+    
+    for (st in stabs) {
+      
+      # Induced N values across pilot replicates for this (scenario, stability)
+      if (st == "rct") {
+        # One N_rct per pilot replicate; sc_dat has repeated rows per rep_id x stability
+        N_induced <- tapply(sc_dat$N_rct, sc_dat$rep_id, function(z) z[1])
+        N_induced <- as.numeric(N_induced)
+      } else {
+        N_induced <- sc_dat$N_proposed[sc_dat$stable_name == st]
+        N_induced <- as.numeric(N_induced)
+      }
+      N_induced <- N_induced[is.finite(N_induced)]
+      if (length(N_induced) == 0) next
+      
+      grd <- power_results[power_results$scenario == sc, , drop = FALSE]
+      if (nrow(grd) == 0) next
+      
+      # if duplicates exist, collapse:
+      grd <- aggregate(cbind(power, success_rate) ~ N, data = grd, FUN = mean)
+      
+      gridN <- as.numeric(grd$N)
+      gridP <- as.numeric(grd$power)
+      ord <- order(gridN)
+      gridN <- gridN[ord]; gridP <- gridP[ord]
+      N_req <- interp_required_N(gridN, gridP, target_power = TARGET_POWER, enforce_monotone = TRUE)
+      
+      mapped <- interp_power_at_N(N_induced, gridN, gridP, enforce_monotone = TRUE)
+      p_map <- mapped$power
+      
+      ok <- is.finite(p_map)
+      n_reps <- sum(ok)
+      n_hit  <- sum(p_map[ok] >= TARGET_POWER)
+      
+      hit_rows[[hh]] <- data.frame(
+        scenario = sc,
+        stable_name = st,
+        n_reps = n_reps,
+        n_hit = n_hit,
+        hit_rate = ifelse(n_reps > 0, n_hit / n_reps, NA_real_),
+        N_req_interp = N_req,
+        stringsAsFactors = FALSE
+      )
+      hh <- hh + 1
+    }
+  }
+  
+  hit_summary <- if (length(hit_rows) > 0) do.call(rbind, hit_rows) else NULL
+  
+  if (!is.null(hit_summary)) {
+    for (sc in unique(hit_summary$scenario)) {
+      message(sprintf("\n--- Scenario: %s ---", sc))
+      tmp <- hit_summary[hit_summary$scenario == sc, , drop = FALSE]
+      tmp <- tmp[order(tmp$stable_name), , drop = FALSE]
+      for (i in 1:nrow(tmp)) {
+        message(sprintf("  %-10s: hits=%d/%d  (hit_rate=%.3f)",
+                        tmp$stable_name[i], tmp$n_hit[i], tmp$n_reps[i], tmp$hit_rate[i]))
+      }
+    }
+    
+    # Optionally save
+    write.csv(hit_summary, "hit_rate_summary.csv", row.names = FALSE)
+    message("\nSaved: hit_rate_summary.csv")
+  } else {
+    message("No hit-rate summary produced (no overlap between pilot_results and power_results).")
+  }
+  
+} else {
+  message("\nNo power_results available; cannot compute hit-rate summary.")
+}
+
+# ==============================================================================
+# 4) Save results (optional)
+# ==============================================================================
+write.csv(pilot_results, "pilot_uncertainty_N_distributions.csv", row.names = FALSE)
+if (!is.null(power_results)) write.csv(power_results, "power_validation_sparse_grid.csv", row.names = FALSE)
+
+message("\n============================================================")
+message("DONE.")
+message("Saved:")
+message("  - pilot_uncertainty_N_distributions.csv")
+message("  - power_validation_sparse_grid.csv (if any)")
+message("============================================================")
+
+library(dplyr)
+result = pilot_results
+result$scenario = factor(result$scenario, levels=c("binary_p0_0.03","binary_p0_0.10","count","cont"))
+result$stable_name = factor(result$stable_name, levels=c("mean","ucb_mean","median","ucb_median","q70","q90"))
+result %>% group_by(scenario) %>% summarise(med=ceiling(median(N_rct)), q1=ceiling(quantile(N_rct, 0.25)),
+                                            q3= ceiling(quantile(N_rct, 0.75)), mean = ceiling(mean(N_rct)))
+View(result %>% group_by(scenario, stable_name) %>% summarise(med=median(N_proposed), q1=quantile(N_proposed, 0.25),
+                                                              q3= quantile(N_proposed, 0.75), mean = mean(N_proposed)))
+
+result %>% group_by(scenario) %>% summarise(mean = round(100*mean(power_Nrct),1), lb=round(100*quantile(power_Nrct, 0.025),1),
+                                            ub= round(100*quantile(power_Nrct, 0.975),1))
+View(result %>% group_by(scenario, stable_name) %>% summarise(mean = round(100*mean(power_Nprop),1), lb=round(100*quantile(power_Nprop, 0.025),1),
+                                                              ub= round(100*quantile(power_Nprop, 0.975),1)))
