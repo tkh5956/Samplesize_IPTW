@@ -17,7 +17,7 @@ The repository contains simulation code to perform pilot-based sample size deter
 
 ## 📂 Folder Overview
 * `/main`: Simulation code for reproducing the main manuscript results.
-* `/supplement`: Simulation code for supplementary results under constant propensity (RCT-like setting).
+* `/supplement`: Simulation code for supplementary results.
 
 ---
 
